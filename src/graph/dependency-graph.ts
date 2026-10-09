@@ -294,6 +294,60 @@ export class DependencyGraph {
     return result;
   }
 
+  public topologicalSortKahn(
+    subset?: ReadonlySet<string>,
+  ): readonly string[] {
+    const selected = subset ?? new Set(this.services());
+    const remainingDependencies = new Map<string, number>();
+
+    for (const service of selected) {
+      this.#lookup(this.#dependencies, service);
+      const dependencies = this.dependenciesOf(service);
+      for (const dependency of dependencies) {
+        if (!selected.has(dependency)) {
+          throw new ValidationError(
+            `Topological subset must include dependency ${dependency} for ${service}`,
+          );
+        }
+      }
+      remainingDependencies.set(service, dependencies.length);
+    }
+
+    const ready = [...selected]
+      .filter((service) => remainingDependencies.get(service) === 0)
+      .sort();
+    const result: string[] = [];
+
+    for (let head = 0; head < ready.length; head += 1) {
+      const service = ready[head];
+      if (service === undefined) {
+        continue;
+      }
+      result.push(service);
+      for (const dependent of this.dependentsOf(service)) {
+        if (!selected.has(dependent)) {
+          continue;
+        }
+        const remaining = remainingDependencies.get(dependent);
+        if (remaining === undefined) {
+          throw new Error('Topological dependency count is inconsistent');
+        }
+        const next = remaining - 1;
+        remainingDependencies.set(dependent, next);
+        if (next === 0) {
+          ready.push(dependent);
+        }
+      }
+    }
+
+    if (result.length !== selected.size) {
+      this.topologicalSortDfs(selected);
+      throw new Error('Kahn cycle detection state is inconsistent');
+    }
+
+    return result;
+  }
+
   #lookup(
     map: ReadonlyMap<string, ReadonlySet<string>>,
     service: string,
