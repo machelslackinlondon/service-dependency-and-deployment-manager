@@ -11,6 +11,8 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx watch src/server.ts",
     "lint": "eslint .",
+    "load:deploy": "tsx load/deployment-burst.ts",
+    "load:graph": "tsx load/graph-benchmark.ts",
     "start": "node dist/server.js",
     "test": "jest",
     "test:coverage": "jest --coverage",
@@ -31,6 +33,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@types/autocannon": "^7.12.7",
     "@types/jest": "^30.0.0",
     "@types/node": "^26.0.0",
     "autocannon": "^8.0.0",
