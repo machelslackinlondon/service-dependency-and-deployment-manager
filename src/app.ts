@@ -2,8 +2,9 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import rateLimit from '@fastify/rate-limit';
 
 import { loadConfig, type AppConfig } from './config.js';
-import { OperationalError } from './errors.js';
+import { CycleError, OperationalError } from './errors.js';
 import { MetadataStore } from './metadata/metadata-store.js';
+import { AppMetrics } from './observability/metrics.js';
 import { registerDeploymentRoutes } from './routes/deployments.js';
 import { registerServiceRoutes } from './routes/services.js';
 import { registerSystemRoutes } from './routes/system.js';
@@ -39,13 +40,46 @@ export async function buildApp(
     ...(options.now === undefined ? {} : { now: options.now }),
   });
   const jobs = new JobStore(config.jobRetention);
+  const metrics = new AppMetrics();
+  const globalSemaphore = new AsyncSemaphore(config.maxActiveDeployments);
   const scheduler = new DeploymentScheduler({
     worker: new DeploymentWorker(config.deploymentTimeoutMs),
     jobs,
     maxDeploymentsPerJob: config.maxDeploymentsPerJob,
     maxActiveJobs: config.maxActiveJobs,
     queue: new BoundedJobQueue(config.maxQueuedDeployments),
-    globalSemaphore: new AsyncSemaphore(config.maxActiveDeployments),
+    globalSemaphore,
+    observer: {
+      stateChanged: (activeDeployments, queueDepth) => {
+        metrics.setActiveDeployments(activeDeployments);
+        metrics.setQueueDepth(queueDepth);
+      },
+      jobAccepted: (job) => {
+        app.log.info(
+          { jobId: job.id, metadataVersion: job.metadataVersion },
+          'deployment job accepted',
+        );
+      },
+      jobStarted: (jobId) => {
+        app.log.info({ jobId }, 'deployment job started');
+      },
+      serviceCompleted: (jobId, result) => {
+        app.log.info(
+          { jobId, service: result.service, outcome: result.status },
+          'service deployment completed',
+        );
+      },
+      jobCompleted: (job, durationSeconds) => {
+        metrics.recordJobCompletion(job.status, durationSeconds);
+        app.log.info(
+          { jobId: job.id, outcome: job.status, durationSeconds },
+          'deployment job completed',
+        );
+      },
+      schedulerFailed: (jobId, error) => {
+        app.log.error({ jobId, error }, 'deployment scheduler failed');
+      },
+    },
   });
 
   await app.register(rateLimit, {
@@ -54,6 +88,9 @@ export async function buildApp(
   });
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof OperationalError) {
+      if (error instanceof CycleError) {
+        metrics.recordCycleFailure();
+      }
       return reply.status(error.statusCode).send({
         error: {
           code: error.code,
@@ -81,9 +118,15 @@ export async function buildApp(
     });
   });
 
-  registerServiceRoutes(app, metadata);
-  registerDeploymentRoutes(app, metadata, scheduler, jobs);
-  registerSystemRoutes(app, metadata, options.enableTestRoutes ?? false);
+  registerServiceRoutes(app, metadata, metrics);
+  registerDeploymentRoutes(app, metadata, scheduler, jobs, metrics);
+  registerSystemRoutes(
+    app,
+    metadata,
+    options.enableTestRoutes ?? false,
+    metrics,
+    new AsyncSemaphore(config.healthCheckConcurrency),
+  );
   app.addHook('onClose', async () => scheduler.stop());
   return app;
 }

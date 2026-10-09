@@ -34,6 +34,16 @@ export interface DeploymentSchedulerOptions {
   readonly maxActiveJobs: number;
   readonly queue: BoundedJobQueue<QueuedDeployment>;
   readonly globalSemaphore: AsyncSemaphore;
+  readonly observer?: DeploymentSchedulerObserver;
+}
+
+export interface DeploymentSchedulerObserver {
+  stateChanged(activeDeployments: number, queueDepth: number): void;
+  jobAccepted(job: DeploymentJob): void;
+  jobStarted(jobId: string): void;
+  serviceCompleted(jobId: string, result: ServiceDeploymentResult): void;
+  jobCompleted(job: DeploymentJob, durationSeconds: number): void;
+  schedulerFailed(jobId: string, error: unknown): void;
 }
 
 interface QueuedDeployment {
@@ -49,6 +59,7 @@ export class DeploymentScheduler {
   readonly #maxActiveJobs: number;
   readonly #queue: BoundedJobQueue<QueuedDeployment>;
   readonly #globalSemaphore: AsyncSemaphore;
+  readonly #observer: DeploymentSchedulerObserver | undefined;
   readonly #running = new Set<Promise<void>>();
   #activeJobs = 0;
   #accepting = true;
@@ -60,6 +71,7 @@ export class DeploymentScheduler {
     this.#maxActiveJobs = options.maxActiveJobs;
     this.#queue = options.queue;
     this.#globalSemaphore = options.globalSemaphore;
+    this.#observer = options.observer;
   }
 
   public start(): void {
@@ -94,6 +106,8 @@ export class DeploymentScheduler {
     });
 
     this.#queue.enqueue({ jobId: job.id, snapshot, selected });
+    this.#observer?.jobAccepted(job);
+    this.#notifyState();
     this.#dispatch();
     return job;
   }
@@ -112,17 +126,28 @@ export class DeploymentScheduler {
         return;
       }
       this.#activeJobs += 1;
+      const startedAt = process.hrtime.bigint();
+      this.#observer?.jobStarted(queued.jobId);
+      this.#notifyState();
       const running = this.#runJob(
         queued.jobId,
         queued.snapshot,
         queued.selected,
       )
         .catch((error: unknown) => {
+          this.#observer?.schedulerFailed(queued.jobId, error);
           this.#handleSchedulerFailure(queued.jobId, error);
         })
         .finally(() => {
+          const durationSeconds =
+            Number(process.hrtime.bigint() - startedAt) / 1_000_000_000;
+          this.#observer?.jobCompleted(
+            this.#jobs.get(queued.jobId),
+            durationSeconds,
+          );
           this.#running.delete(running);
           this.#activeJobs -= 1;
+          this.#notifyState();
           this.#dispatch();
         });
       this.#running.add(running);
@@ -179,6 +204,7 @@ export class DeploymentScheduler {
       const completed = await Promise.race(active.values());
       active.delete(completed.service);
       this.#jobs.setResult(jobId, completed.result);
+      this.#observer?.serviceCompleted(jobId, completed.result);
 
       if (completed.result.status === 'succeeded') {
         for (const dependent of snapshot.graph.dependentsOf(completed.service)) {
@@ -213,6 +239,7 @@ export class DeploymentScheduler {
     definition: ServiceDefinition,
   ): Promise<ServiceDeploymentResult> {
     const release = await this.#globalSemaphore.acquire();
+    this.#notifyState();
     try {
       try {
         return await this.#worker.deploy(
@@ -228,6 +255,7 @@ export class DeploymentScheduler {
       }
     } finally {
       release();
+      this.#notifyState();
     }
   }
 
@@ -290,6 +318,13 @@ export class DeploymentScheduler {
       }
     }
     this.#jobs.complete(jobId, 'failed');
+  }
+
+  #notifyState(): void {
+    this.#observer?.stateChanged(
+      this.#globalSemaphore.active,
+      this.#queue.depth,
+    );
   }
 }
 

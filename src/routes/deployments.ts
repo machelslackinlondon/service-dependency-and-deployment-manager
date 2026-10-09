@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 
 import type { DeploymentJob } from '../domain/service.js';
 import type { MetadataStore } from '../metadata/metadata-store.js';
+import type { AppMetrics } from '../observability/metrics.js';
 import type { DeploymentScheduler } from '../scheduler/deployment-scheduler.js';
 import type { JobStore } from '../scheduler/job-store.js';
 
@@ -22,6 +23,7 @@ export function registerDeploymentRoutes(
   metadata: MetadataStore,
   scheduler: DeploymentScheduler,
   jobs: JobStore,
+  metrics: AppMetrics,
 ): void {
   app.get<{ Querystring: OrderQuery }>(
     '/deployment-order',
@@ -39,10 +41,16 @@ export function registerDeploymentRoutes(
     (request) => {
       const snapshot = metadata.snapshot();
       const algorithm = request.query.algorithm ?? 'kahn';
-      const order =
-        algorithm === 'dfs'
-          ? snapshot.graph.topologicalSortDfs()
-          : snapshot.graph.topologicalSortKahn();
+      const startedAt = process.hrtime.bigint();
+      let order: readonly string[];
+      try {
+        order =
+          algorithm === 'dfs'
+            ? snapshot.graph.topologicalSortDfs()
+            : snapshot.graph.topologicalSortKahn();
+      } finally {
+        metrics.observeTopologicalSort(elapsedSeconds(startedAt));
+      }
       return { algorithm, order, metadataVersion: snapshot.version };
     },
   );
@@ -66,6 +74,7 @@ export function registerDeploymentRoutes(
       },
     },
     (request, reply) => {
+      metrics.recordDeploymentRequest();
       const snapshot = metadata.snapshot();
       const job = scheduler.submit(snapshot, request.body.targets);
       return reply
@@ -89,6 +98,10 @@ export function registerDeploymentRoutes(
     },
     (request) => serializeJob(jobs.get(request.params.id)),
   );
+}
+
+function elapsedSeconds(startedAt: bigint): number {
+  return Number(process.hrtime.bigint() - startedAt) / 1_000_000_000;
 }
 
 function serializeJob(job: DeploymentJob): Record<string, unknown> {

@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 
 import type { CreateServiceInput } from '../domain/service.js';
 import type { MetadataStore } from '../metadata/metadata-store.js';
+import type { AppMetrics } from '../observability/metrics.js';
 
 interface DependencyBody {
   readonly service: string;
@@ -16,6 +17,7 @@ const serviceNameSchema = {
 export function registerServiceRoutes(
   app: FastifyInstance,
   metadata: MetadataStore,
+  metrics: AppMetrics,
 ): void {
   app.post<{ Body: CreateServiceInput }>(
     '/services',
@@ -38,7 +40,14 @@ export function registerServiceRoutes(
       },
     },
     (request, reply) => {
-      const service = metadata.addService(request.body);
+      const startedAt = process.hrtime.bigint();
+      let service;
+      try {
+        service = metadata.addService(request.body);
+      } finally {
+        metrics.observeGraphBuild(elapsedSeconds(startedAt));
+      }
+      metrics.setGraphSize(metadata.snapshot().graph.size);
       return reply.status(201).send(service);
     },
   );
@@ -59,11 +68,22 @@ export function registerServiceRoutes(
       },
     },
     (request, reply) => {
-      const edge = metadata.addDependency(
-        request.body.service,
-        request.body.dependency,
-      );
+      const startedAt = process.hrtime.bigint();
+      let edge;
+      try {
+        edge = metadata.addDependency(
+          request.body.service,
+          request.body.dependency,
+        );
+      } finally {
+        metrics.observeGraphBuild(elapsedSeconds(startedAt));
+      }
+      metrics.setGraphSize(metadata.snapshot().graph.size);
       return reply.status(201).send(edge);
     },
   );
+}
+
+function elapsedSeconds(startedAt: bigint): number {
+  return Number(process.hrtime.bigint() - startedAt) / 1_000_000_000;
 }
