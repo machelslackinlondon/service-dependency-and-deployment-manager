@@ -25,6 +25,9 @@ export async function buildApp(
   options: BuildAppOptions = {},
 ): Promise<FastifyInstance> {
   const config = options.config ?? loadConfig();
+  if (config.nodeEnv === 'production' && options.enableTestRoutes === true) {
+    throw new Error('Test routes cannot be enabled in production');
+  }
   const app = Fastify({
     logger:
       options.logger === undefined
@@ -81,6 +84,11 @@ export async function buildApp(
       },
     },
   });
+  const metadataHeartbeat = setInterval(
+    () => metadata.refresh(),
+    Math.max(1, Math.floor(config.metadataMaxAgeMs / 2)),
+  );
+  metadataHeartbeat.unref();
 
   await app.register(rateLimit, {
     max: config.rateLimitMax,
@@ -127,7 +135,14 @@ export async function buildApp(
     metrics,
     new AsyncSemaphore(config.healthCheckConcurrency),
   );
-  app.addHook('onClose', async () => scheduler.stop());
+  app.addHook('onClose', async () => {
+    clearInterval(metadataHeartbeat);
+    return withTimeout(
+      scheduler.stop(),
+      config.shutdownGraceMs,
+      `Scheduler shutdown exceeded ${config.shutdownGraceMs}ms grace period`,
+    );
+  });
   return app;
 }
 
@@ -135,4 +150,22 @@ function isValidationError(
   error: unknown,
 ): error is Error & { readonly validation: unknown } {
   return error instanceof Error && 'validation' in error;
+}
+
+async function withTimeout<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  try {
+    return await Promise.race([operation, timeout]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
 }

@@ -71,4 +71,18 @@ describe('MetadataStore', () => {
     time = 2_001;
     expect(() => store.snapshot()).toThrow('Dependency metadata is stale');
   });
+
+  test('refreshes unchanged available metadata without changing its version', () => {
+    let time = 1_000;
+    const store = createStore(() => time);
+    store.addService({ name: 'api' });
+
+    time = 1_900;
+    expect(store.refresh()).toBe(true);
+    time = 2_800;
+    expect(store.snapshot().version).toBe(1);
+
+    store.setAvailability(false);
+    expect(store.refresh()).toBe(false);
+  });
 });

@@ -110,6 +110,14 @@ export class MetadataStore {
     this.#available = available;
   }
 
+  public refresh(): boolean {
+    if (!this.#available) {
+      return false;
+    }
+    this.#updatedAt = this.#now();
+    return true;
+  }
+
   #commitMutation(): void {
     this.#version += 1;
     this.#updatedAt = this.#now();

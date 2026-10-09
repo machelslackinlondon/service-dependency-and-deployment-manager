@@ -5,7 +5,7 @@ import type {
   DeploymentJobStatus,
   ServiceDeploymentResult,
 } from '../domain/service.js';
-import { NotFoundError } from '../errors.js';
+import { CapacityError, NotFoundError } from '../errors.js';
 
 interface MutableJob {
   readonly id: string;
@@ -27,15 +27,23 @@ export interface CreateJobInput {
 export class JobStore {
   readonly #jobs = new Map<string, MutableJob>();
 
-  public constructor(private readonly retention: number) {}
+  public constructor(private readonly retention: number) {
+    if (!Number.isSafeInteger(retention) || retention < 1) {
+      throw new Error('Job retention must be a positive integer');
+    }
+  }
 
   public create(input: CreateJobInput): DeploymentJob {
     while (this.#jobs.size >= this.retention) {
-      const oldest = this.#jobs.keys().next().value;
-      if (oldest === undefined) {
-        break;
+      const oldestTerminal = [...this.#jobs.values()].find((job) =>
+        ['succeeded', 'partial', 'failed', 'timed_out'].includes(job.status),
+      );
+      if (oldestTerminal === undefined) {
+        throw new CapacityError(
+          'Deployment job retention capacity exceeded',
+        );
       }
-      this.#jobs.delete(oldest);
+      this.#jobs.delete(oldestTerminal.id);
     }
 
     const job: MutableJob = {

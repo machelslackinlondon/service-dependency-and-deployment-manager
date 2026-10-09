@@ -1,4 +1,5 @@
 export interface AppConfig {
+  readonly nodeEnv: 'development' | 'test' | 'production';
   readonly host: string;
   readonly port: number;
   readonly logLevel: string;
@@ -35,9 +36,18 @@ function positiveInteger(
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
+  const nodeEnv = env.NODE_ENV ?? 'development';
+  if (!['development', 'test', 'production'].includes(nodeEnv)) {
+    throw new Error('NODE_ENV must be development, test, or production');
+  }
+  const port = positiveInteger(env, 'PORT', 3000);
+  if (port > 65_535) {
+    throw new Error('PORT must be between 1 and 65535');
+  }
   return Object.freeze({
+    nodeEnv: nodeEnv as AppConfig['nodeEnv'],
     host: env.HOST ?? '0.0.0.0',
-    port: positiveInteger(env, 'PORT', 3000),
+    port,
     logLevel: env.LOG_LEVEL ?? 'info',
     maxServices: positiveInteger(env, 'MAX_SERVICES', 10_000),
     maxEdges: positiveInteger(env, 'MAX_EDGES', 50_000),

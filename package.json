@@ -5,7 +5,7 @@
   "type": "module",
   "private": false,
   "engines": {
-    "node": ">=22"
+    "node": "^22 || ^24 || >=26"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -13,7 +13,7 @@
     "lint": "eslint .",
     "load:deploy": "tsx load/deployment-burst.ts",
     "load:graph": "tsx load/graph-benchmark.ts",
-    "start": "node dist/server.js",
+    "start": "node dist/src/server.js",
     "test": "jest",
     "test:coverage": "jest --coverage",
     "typecheck": "tsc -p tsconfig.json --noEmit"

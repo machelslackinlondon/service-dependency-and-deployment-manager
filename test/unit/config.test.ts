@@ -19,4 +19,17 @@ describe('loadConfig', () => {
       );
     },
   );
+
+  test('rejects an out-of-range TCP port', () => {
+    expect(() => loadConfig({ PORT: '65536' })).toThrow(
+      'PORT must be between 1 and 65535',
+    );
+  });
+
+  test('validates the runtime environment', () => {
+    expect(loadConfig({ NODE_ENV: 'production' }).nodeEnv).toBe('production');
+    expect(() => loadConfig({ NODE_ENV: 'staging' })).toThrow(
+      'NODE_ENV must be development, test, or production',
+    );
+  });
 });
