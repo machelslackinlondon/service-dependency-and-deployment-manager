@@ -59,3 +59,9 @@ export class MetadataStaleError extends OperationalError {
     super(message, 'METADATA_STALE', 503, true);
   }
 }
+
+export class SchedulerUnavailableError extends OperationalError {
+  public constructor(message = 'Deployment scheduler is stopping') {
+    super(message, 'SCHEDULER_UNAVAILABLE', 503, true);
+  }
+}

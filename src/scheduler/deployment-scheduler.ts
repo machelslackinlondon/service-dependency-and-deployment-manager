@@ -3,7 +3,11 @@ import type {
   ServiceDefinition,
   ServiceDeploymentResult,
 } from '../domain/service.js';
-import { CapacityError, NotFoundError } from '../errors.js';
+import {
+  CapacityError,
+  NotFoundError,
+  SchedulerUnavailableError,
+} from '../errors.js';
 import type { DependencyGraph } from '../graph/dependency-graph.js';
 import type { AsyncSemaphore } from './async-semaphore.js';
 import type { BoundedJobQueue } from './bounded-job-queue.js';
@@ -47,6 +51,7 @@ export class DeploymentScheduler {
   readonly #globalSemaphore: AsyncSemaphore;
   readonly #running = new Set<Promise<void>>();
   #activeJobs = 0;
+  #accepting = true;
 
   public constructor(options: DeploymentSchedulerOptions) {
     this.#worker = options.worker;
@@ -57,7 +62,10 @@ export class DeploymentScheduler {
     this.#globalSemaphore = options.globalSemaphore;
   }
 
-  public start(): void {}
+  public start(): void {
+    this.#accepting = true;
+    this.#dispatch();
+  }
 
   public get queueDepth(): number {
     return this.#queue.depth;
@@ -71,6 +79,9 @@ export class DeploymentScheduler {
     snapshot: DeploymentSnapshot,
     targets?: readonly string[],
   ): DeploymentJob {
+    if (!this.#accepting) {
+      throw new SchedulerUnavailableError();
+    }
     const requestedTargets = targets ?? snapshot.graph.services();
     const selected = snapshot.graph.dependencyClosure(requestedTargets);
     if (this.#queue.isFull) {
@@ -88,6 +99,7 @@ export class DeploymentScheduler {
   }
 
   public async stop(): Promise<void> {
+    this.#accepting = false;
     while (this.#running.size > 0 || this.#queue.depth > 0) {
       await Promise.allSettled([...this.#running]);
     }
@@ -105,8 +117,8 @@ export class DeploymentScheduler {
         queued.snapshot,
         queued.selected,
       )
-        .catch(() => {
-          this.#jobs.complete(queued.jobId, 'failed');
+        .catch((error: unknown) => {
+          this.#handleSchedulerFailure(queued.jobId, error);
         })
         .finally(() => {
           this.#running.delete(running);
@@ -139,6 +151,7 @@ export class DeploymentScheduler {
       string,
       Promise<{ service: string; result: ServiceDeploymentResult }>
     >();
+    const blocked = new Set<string>();
 
     while (readyHead < ready.length || active.size > 0) {
       while (
@@ -182,10 +195,18 @@ export class DeploymentScheduler {
             ready.push(dependent);
           }
         }
+      } else {
+        this.#blockDependents(
+          jobId,
+          snapshot.graph,
+          selected,
+          completed.service,
+          blocked,
+        );
       }
     }
 
-    this.#jobs.complete(jobId, 'succeeded');
+    this.#jobs.complete(jobId, this.#classify(jobId));
   }
 
   async #deploy(
@@ -193,12 +214,85 @@ export class DeploymentScheduler {
   ): Promise<ServiceDeploymentResult> {
     const release = await this.#globalSemaphore.acquire();
     try {
-      return await this.#worker.deploy(
-        definition,
-        new AbortController().signal,
-      );
+      try {
+        return await this.#worker.deploy(
+          definition,
+          new AbortController().signal,
+        );
+      } catch (error) {
+        return {
+          service: definition.name,
+          status: 'failed',
+          error: errorMessage(error),
+        };
+      }
     } finally {
       release();
     }
   }
+
+  #blockDependents(
+    jobId: string,
+    graph: DependencyGraph,
+    selected: ReadonlySet<string>,
+    failedService: string,
+    blocked: Set<string>,
+  ): void {
+    const queue = [...graph.dependentsOf(failedService)];
+    for (let head = 0; head < queue.length; head += 1) {
+      const dependent = queue[head];
+      if (
+        dependent === undefined ||
+        !selected.has(dependent) ||
+        blocked.has(dependent)
+      ) {
+        continue;
+      }
+      blocked.add(dependent);
+      this.#jobs.setResult(jobId, {
+        service: dependent,
+        status: 'blocked',
+        blockedBy: failedService,
+      });
+      queue.push(...graph.dependentsOf(dependent));
+    }
+  }
+
+  #classify(jobId: string): 'succeeded' | 'partial' | 'failed' | 'timed_out' {
+    const results = [...this.#jobs.get(jobId).results.values()];
+    if (results.every((result) => result.status === 'succeeded')) {
+      return 'succeeded';
+    }
+    if (results.some((result) => result.status === 'succeeded')) {
+      return 'partial';
+    }
+    const directFailures = results.filter(
+      (result) => result.status === 'failed' || result.status === 'timed_out',
+    );
+    if (
+      directFailures.length > 0 &&
+      directFailures.every((result) => result.status === 'timed_out')
+    ) {
+      return 'timed_out';
+    }
+    return 'failed';
+  }
+
+  #handleSchedulerFailure(jobId: string, error: unknown): void {
+    const job = this.#jobs.get(jobId);
+    for (const result of job.results.values()) {
+      if (result.status === 'pending' || result.status === 'running') {
+        this.#jobs.setResult(jobId, {
+          service: result.service,
+          status: 'blocked',
+          error: `Scheduler failure: ${errorMessage(error)}`,
+        });
+      }
+    }
+    this.#jobs.complete(jobId, 'failed');
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'Unknown scheduler failure';
 }
