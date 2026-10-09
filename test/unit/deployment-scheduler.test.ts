@@ -8,6 +8,8 @@ import {
   type DeploymentExecutor,
   type DeploymentSnapshot,
 } from '../../src/scheduler/deployment-scheduler.js';
+import { AsyncSemaphore } from '../../src/scheduler/async-semaphore.js';
+import { BoundedJobQueue } from '../../src/scheduler/bounded-job-queue.js';
 import { JobStore } from '../../src/scheduler/job-store.js';
 
 class ControlledWorker implements DeploymentExecutor {
@@ -95,6 +97,9 @@ describe('DeploymentScheduler', () => {
       worker,
       jobs,
       maxDeploymentsPerJob: 2,
+      maxActiveJobs: 2,
+      queue: new BoundedJobQueue(10),
+      globalSemaphore: new AsyncSemaphore(2),
     });
 
     const accepted = scheduler.submit(snapshot());
@@ -126,6 +131,9 @@ describe('DeploymentScheduler', () => {
       worker: new ImmediateWorker(),
       jobs,
       maxDeploymentsPerJob: 2,
+      maxActiveJobs: 2,
+      queue: new BoundedJobQueue(10),
+      globalSemaphore: new AsyncSemaphore(2),
     });
 
     const accepted = scheduler.submit(snapshot(), ['api']);
@@ -136,5 +144,46 @@ describe('DeploymentScheduler', () => {
       'database',
     ]);
     await waitFor(() => expect(jobs.get(accepted.id).status).toBe('succeeded'));
+  });
+
+  test('rejects saturation and never exceeds the global deployment limit', async () => {
+    const worker = new ControlledWorker();
+    const jobs = new JobStore(100);
+    const semaphore = new AsyncSemaphore(2);
+    const scheduler = new DeploymentScheduler({
+      worker,
+      jobs,
+      maxDeploymentsPerJob: 4,
+      maxActiveJobs: 1,
+      queue: new BoundedJobQueue(1),
+      globalSemaphore: semaphore,
+    });
+
+    const first = scheduler.submit(snapshot());
+    const second = scheduler.submit(snapshot());
+
+    expect(() => scheduler.submit(snapshot())).toThrow(
+      'Deployment queue capacity exceeded',
+    );
+    await waitFor(() => expect(worker.started).toHaveLength(2));
+    expect(semaphore.active).toBe(2);
+
+    worker.release('database');
+    worker.release('worker');
+    await waitFor(() => expect(worker.started).toContain('auth'));
+    worker.release('auth');
+    await waitFor(() => expect(worker.started).toContain('api'));
+    worker.release('api');
+    await waitFor(() => expect(jobs.get(first.id).status).toBe('succeeded'));
+
+    await waitFor(() => expect(worker.started).toHaveLength(6));
+    worker.release('database');
+    worker.release('worker');
+    await waitFor(() => expect(worker.started).toHaveLength(7));
+    worker.release('auth');
+    await waitFor(() => expect(worker.started).toHaveLength(8));
+    worker.release('api');
+    await waitFor(() => expect(jobs.get(second.id).status).toBe('succeeded'));
+    expect(semaphore.active).toBe(0);
   });
 });

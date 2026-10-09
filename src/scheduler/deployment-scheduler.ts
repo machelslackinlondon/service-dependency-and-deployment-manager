@@ -3,8 +3,10 @@ import type {
   ServiceDefinition,
   ServiceDeploymentResult,
 } from '../domain/service.js';
-import { NotFoundError } from '../errors.js';
+import { CapacityError, NotFoundError } from '../errors.js';
 import type { DependencyGraph } from '../graph/dependency-graph.js';
+import type { AsyncSemaphore } from './async-semaphore.js';
+import type { BoundedJobQueue } from './bounded-job-queue.js';
 import type { JobStore } from './job-store.js';
 
 export interface DeploymentSnapshot {
@@ -25,21 +27,45 @@ export interface DeploymentSchedulerOptions {
   readonly worker: DeploymentExecutor;
   readonly jobs: JobStore;
   readonly maxDeploymentsPerJob: number;
+  readonly maxActiveJobs: number;
+  readonly queue: BoundedJobQueue<QueuedDeployment>;
+  readonly globalSemaphore: AsyncSemaphore;
+}
+
+interface QueuedDeployment {
+  readonly jobId: string;
+  readonly snapshot: DeploymentSnapshot;
+  readonly selected: ReadonlySet<string>;
 }
 
 export class DeploymentScheduler {
   readonly #worker: DeploymentExecutor;
   readonly #jobs: JobStore;
   readonly #maxDeploymentsPerJob: number;
+  readonly #maxActiveJobs: number;
+  readonly #queue: BoundedJobQueue<QueuedDeployment>;
+  readonly #globalSemaphore: AsyncSemaphore;
   readonly #running = new Set<Promise<void>>();
+  #activeJobs = 0;
 
   public constructor(options: DeploymentSchedulerOptions) {
     this.#worker = options.worker;
     this.#jobs = options.jobs;
     this.#maxDeploymentsPerJob = options.maxDeploymentsPerJob;
+    this.#maxActiveJobs = options.maxActiveJobs;
+    this.#queue = options.queue;
+    this.#globalSemaphore = options.globalSemaphore;
   }
 
   public start(): void {}
+
+  public get queueDepth(): number {
+    return this.#queue.depth;
+  }
+
+  public get activeJobs(): number {
+    return this.#activeJobs;
+  }
 
   public submit(
     snapshot: DeploymentSnapshot,
@@ -47,26 +73,48 @@ export class DeploymentScheduler {
   ): DeploymentJob {
     const requestedTargets = targets ?? snapshot.graph.services();
     const selected = snapshot.graph.dependencyClosure(requestedTargets);
+    if (this.#queue.isFull) {
+      throw new CapacityError('Deployment queue capacity exceeded');
+    }
     const job = this.#jobs.create({
       metadataVersion: snapshot.version,
       requestedTargets,
       selectedServices: [...selected],
     });
 
-    const running = Promise.resolve()
-      .then(() => this.#runJob(job.id, snapshot, selected))
-      .catch(() => {
-        this.#jobs.complete(job.id, 'failed');
-      })
-      .finally(() => {
-        this.#running.delete(running);
-      });
-    this.#running.add(running);
+    this.#queue.enqueue({ jobId: job.id, snapshot, selected });
+    this.#dispatch();
     return job;
   }
 
   public async stop(): Promise<void> {
-    await Promise.allSettled([...this.#running]);
+    while (this.#running.size > 0 || this.#queue.depth > 0) {
+      await Promise.allSettled([...this.#running]);
+    }
+  }
+
+  #dispatch(): void {
+    while (this.#activeJobs < this.#maxActiveJobs) {
+      const queued = this.#queue.dequeue();
+      if (queued === undefined) {
+        return;
+      }
+      this.#activeJobs += 1;
+      const running = this.#runJob(
+        queued.jobId,
+        queued.snapshot,
+        queued.selected,
+      )
+        .catch(() => {
+          this.#jobs.complete(queued.jobId, 'failed');
+        })
+        .finally(() => {
+          this.#running.delete(running);
+          this.#activeJobs -= 1;
+          this.#dispatch();
+        });
+      this.#running.add(running);
+    }
   }
 
   async #runJob(
@@ -107,8 +155,7 @@ export class DeploymentScheduler {
           throw new NotFoundError(`Service metadata not found: ${service}`);
         }
         this.#jobs.setResult(jobId, { service, status: 'running' });
-        const promise = this.#worker
-          .deploy(definition, new AbortController().signal)
+        const promise = this.#deploy(definition)
           .then((result) => ({ service, result }));
         active.set(service, promise);
       }
@@ -139,5 +186,19 @@ export class DeploymentScheduler {
     }
 
     this.#jobs.complete(jobId, 'succeeded');
+  }
+
+  async #deploy(
+    definition: ServiceDefinition,
+  ): Promise<ServiceDeploymentResult> {
+    const release = await this.#globalSemaphore.acquire();
+    try {
+      return await this.#worker.deploy(
+        definition,
+        new AbortController().signal,
+      );
+    } finally {
+      release();
+    }
   }
 }
