@@ -3,6 +3,7 @@ import {
   ConflictError,
   CycleError,
   NotFoundError,
+  ValidationError,
 } from '../errors.js';
 
 export interface DependencyEdge {
@@ -213,6 +214,84 @@ export class DependencyGraph {
     if (cycle !== null) {
       throw new CycleError(cycle);
     }
+  }
+
+  public topologicalSortDfs(
+    subset?: ReadonlySet<string>,
+  ): readonly string[] {
+    type Color = 0 | 1 | 2;
+    interface Frame {
+      readonly service: string;
+      readonly dependencies: readonly string[];
+      index: number;
+    }
+
+    const selected = subset ?? new Set(this.services());
+    for (const service of selected) {
+      this.#lookup(this.#dependencies, service);
+      for (const dependency of this.dependenciesOf(service)) {
+        if (!selected.has(dependency)) {
+          throw new ValidationError(
+            `Topological subset must include dependency ${dependency} for ${service}`,
+          );
+        }
+      }
+    }
+
+    const colors = new Map<string, Color>();
+    const result: string[] = [];
+    const path: string[] = [];
+    const pathIndexes = new Map<string, number>();
+
+    for (const root of [...selected].sort()) {
+      if ((colors.get(root) ?? 0) !== 0) {
+        continue;
+      }
+      colors.set(root, 1);
+      pathIndexes.set(root, path.length);
+      path.push(root);
+      const stack: Frame[] = [
+        { service: root, dependencies: this.dependenciesOf(root), index: 0 },
+      ];
+
+      while (stack.length > 0) {
+        const frame = stack.at(-1);
+        if (frame === undefined) {
+          break;
+        }
+        const dependency = frame.dependencies[frame.index];
+        if (dependency === undefined) {
+          colors.set(frame.service, 2);
+          result.push(frame.service);
+          pathIndexes.delete(frame.service);
+          path.pop();
+          stack.pop();
+          continue;
+        }
+        frame.index += 1;
+
+        const color = colors.get(dependency) ?? 0;
+        if (color === 1) {
+          const cycleStart = pathIndexes.get(dependency);
+          if (cycleStart === undefined) {
+            throw new Error('Cycle path state is inconsistent');
+          }
+          throw new CycleError([...path.slice(cycleStart), dependency]);
+        }
+        if (color === 0) {
+          colors.set(dependency, 1);
+          pathIndexes.set(dependency, path.length);
+          path.push(dependency);
+          stack.push({
+            service: dependency,
+            dependencies: this.dependenciesOf(dependency),
+            index: 0,
+          });
+        }
+      }
+    }
+
+    return result;
   }
 
   #lookup(
