@@ -1,6 +1,7 @@
 import {
   CapacityError,
   ConflictError,
+  CycleError,
   NotFoundError,
 } from '../errors.js';
 
@@ -142,6 +143,76 @@ export class DependencyGraph {
     }
 
     return visited;
+  }
+
+  public findCycle(): readonly string[] | null {
+    type Color = 0 | 1 | 2;
+    interface Frame {
+      readonly service: string;
+      readonly dependencies: readonly string[];
+      index: number;
+    }
+
+    const colors = new Map<string, Color>();
+    const path: string[] = [];
+    const pathIndexes = new Map<string, number>();
+
+    for (const root of this.services()) {
+      if ((colors.get(root) ?? 0) !== 0) {
+        continue;
+      }
+
+      colors.set(root, 1);
+      pathIndexes.set(root, path.length);
+      path.push(root);
+      const stack: Frame[] = [
+        { service: root, dependencies: this.dependenciesOf(root), index: 0 },
+      ];
+
+      while (stack.length > 0) {
+        const frame = stack.at(-1);
+        if (frame === undefined) {
+          break;
+        }
+        const dependency = frame.dependencies[frame.index];
+        if (dependency === undefined) {
+          colors.set(frame.service, 2);
+          pathIndexes.delete(frame.service);
+          path.pop();
+          stack.pop();
+          continue;
+        }
+        frame.index += 1;
+
+        const color = colors.get(dependency) ?? 0;
+        if (color === 1) {
+          const cycleStart = pathIndexes.get(dependency);
+          if (cycleStart === undefined) {
+            throw new Error('Cycle path state is inconsistent');
+          }
+          return [...path.slice(cycleStart), dependency];
+        }
+        if (color === 0) {
+          colors.set(dependency, 1);
+          pathIndexes.set(dependency, path.length);
+          path.push(dependency);
+          stack.push({
+            service: dependency,
+            dependencies: this.dependenciesOf(dependency),
+            index: 0,
+          });
+        }
+      }
+    }
+
+    return null;
+  }
+
+  public assertAcyclic(): void {
+    const cycle = this.findCycle();
+    if (cycle !== null) {
+      throw new CycleError(cycle);
+    }
   }
 
   #lookup(
